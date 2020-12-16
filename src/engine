@@ -1,0 +1,418 @@
+import argparse
+import networkx as nx
+import numpy as np
+import scipy.sparse as sp
+import torch
+import pickle as pkl
+import logging
+
+from sklearn.metrics import roc_auc_score
+from sklearn.metrics import average_precision_score
+
+from hgdata_prepare import *
+from components import *
+from loss import *
+from layers import *
+from config import *
+from components import _1hot
+
+# parser = argparse.ArgumentParser()
+# parser.add_argument('--hidden_dim', type=int, default=400)
+# parser.add_argument('--out_dim', type=int, default=100)
+# parser.add_argument('--update_ratio', type=float, default=0.33)
+# parser.add_argument('--problem', type=str, default='coauthorship')
+# parser.add_argument('--dataset', type=str, default='cora')
+# parser.add_argument('--seed', default=None)
+# parser.add_argument('--refit', type=int, default=0)
+# args = parser.parse_args()
+
+refit = refit > 0
+unseen = True
+#datasetroot = '../data/' + args.problem + '/' + args.dataset + '/'
+seed = float(seed) if seed else None
+if seed is not None:
+    np.random.seed(seed)
+
+
+#fmat_all, Hdict, labels, train_batch_indexes, test_batch_indexes = dt_read_all(datasetroot)
+adj_train, X_train, labels_train, adj_all, X_all, labels_all = dtinit(datasetroot, with_test=True,  test_ratio=0.3)
+dataset = HGraphSequenceRandSet(adj_train, X_train, labels_all, num_permutation=400, seed=seed, fix=False)
+
+num_of_nodes = adj_all.shape[0]
+# size_update = int(num_of_nodes * update_ratio)
+size_update = 3
+
+params = {'batch_size': 1,
+          'shuffle': True,
+          'num_workers': 2}
+
+dataloader = torch.utils.data.DataLoader(dataset, **params)
+
+features_dim = X_train.shape[1]
+hgcn_step = recurHGC_add(features_dim, hidden_dim, out_dim, dropout=0.3)
+hgcn_vae = GraphVae(features_dim, hidden_dim, out_dim, dropout=0)
+decoder = MLP(features_dim, hidden_dim, out_dim, dropout=0)
+classifier = GCN_classifier(features_dim, hidden_dim, num_class)
+Regressor = GCN_regress(features_dim, hidden_dim, 1)
+
+def classifier_engine(size_update):
+    """
+    #     to run the training process
+    #     :param hgcn_step: the hgcn add_on module
+    #     :param hgcn_vae: encoder variational procedure
+    #     :param decoder: can be sort of MLP
+    #     :param classifier: can be sort of MLP
+    #     :return: none
+    #     """
+    # optimizers for log P(A_i+1,X_i+1|A_i, X_i)
+    optimizer_embedder = torch.optim.Adam(hgcn_step.parameters(), lr=1e-3)
+    optimizer_vae = torch.optim.Adam(hgcn_vae.parameters(), lr=1e-3)
+    optimizer_decoder = torch.optim.Adam(decoder.parameters(), lr=1e-3)
+    #optimizer for log P(class|X_i+1)
+    optimizer_classifier = torch.optim.Adam(classifier.parameters(), lr=1e-3)
+    train_loss = 0
+
+    for batch_idx, (adj, feat, labels) in enumerate(dataloader):
+        adj = adj[0]
+
+        if adj.size()[0] <= size_update:
+            print("Warning: sample size {} too small".format(adj.size()[0]))
+            continue
+
+        # train R-LHGCN: for recovery of series of adjs
+        print('training on embedder begins')
+        optimizer_embedder.zero_grad()
+        hgcn_step.train()
+        feat = torch.squeeze(feat)
+        #try:
+        loss = recursive_loss_with_noise(hgcn_step, adj, feat, labels, size_update, classifier)
+        #except:
+            #p=1
+        loss.backward(retain_graph=True)
+        train_loss += loss.item()
+        optimizer_embedder.step()
+
+        # train LGCN via VAE
+        print('training on VAE begins')
+        optimizer_vae.zero_grad()
+        hgcn_vae.train()
+        adj_vae_norm = anormalize(adj)
+        z_mean, z_log_std = hgcn_vae(adj_vae_norm, feat)
+        vae_class_train_loss = vae_loss_classify(z_mean, z_log_std, adj, feat, labels,  classifier)
+        vae_class_train_loss.backward(retain_graph=True)
+        optimizer_vae.step()
+
+        #train decoder for adjs
+        print('training on decoder begins')
+        optimizer_decoder.zero_grad()
+        decoder.train()
+        z_mean, z_log_std = decoder(feat)
+        decoder_train_loss = vae_loss_classify(z_mean, z_log_std, adj, feat, labels,  classifier)
+        decoder_train_loss.backward(retain_graph=True)
+        optimizer_decoder.step()
+
+        #train the gcn classifier
+        print('training on classifier begins')
+        optimizer_classifier.zero_grad()
+        classifier.train()
+        classifier_train_loss = vae_loss_classify(z_mean, z_log_std, adj, feat, labels,  classifier)
+        classifier_train_loss.backward(retain_graph=True)
+        optimizer_classifier.step()
+
+        if batch_idx % 10 == 0:
+            info ='R-LHGCN [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(batch_idx, len(dataloader),
+                    100. * batch_idx / len(dataloader),
+                    loss.item())
+            print(info)
+            logging.info(info)
+            torch.save(hgcn_step.state_dict(), '../models/hgcn_step/%d.pth'%batch_idx)
+
+            info = 'LGCN [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(batch_idx, len(dataloader),
+                    100. * batch_idx / len(dataloader),
+                    vae_class_train_loss.item())
+            print(info)
+            logging.info(info)
+            torch.save(hgcn_vae.state_dict(), '../models/hgcn_vae/%d.pth' % batch_idx)
+
+            info = 'Decoder [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(batch_idx, len(dataloader),
+                    100. * batch_idx / len(dataloader),
+                    decoder_train_loss.item())
+            print(info)
+            logging.info(info)
+            torch.save(decoder.state_dict(), '../models/decoder/%d.pth' % batch_idx)
+
+            info = 'Classifier [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(batch_idx, len(dataloader),
+                                                                    100. * batch_idx / len(dataloader),
+                                                                    classifier_train_loss.item())
+            print(info)
+            logging.info(info)
+            torch.save(classifier.state_dict(), '../models/classifier/%d.pth' % batch_idx)
+
+            # with torch.no_grad():# model.eval() is not proper
+            #     adj_feed_norm = anormalize(adj_train)
+            #     adj_gt_all = adj_all
+            #
+            #     #feat = X_train
+            #     #feat_all = X_all
+            #
+            #     mask = torch.ones_like(adj_gt_all).type(torch.ByteTensor)
+            #     mask[:feat.size()[0], :feat.size()[0]] = 0
+            #
+            #     diag_mask = torch.eye(mask.size(0)).type(torch.ByteTensor)
+            #     mask = mask * (1 - diag_mask)
+            #
+            #     mask = get_equal_mask(adj_gt_all, mask)
+            #
+            #     # test r-lhgcn
+            #     hgcn_step.eval()
+            #     z_mean_old, z_log_std_old, z_mean_new, z_log_std_new = hgcn_step(adj_train, feat,
+            #                                                                     X_all[feat.size()[0]:, :])
+            #     z_mean = torch.cat((z_mean_old, z_mean_new))
+            #     z_log_std = torch.cat((z_log_std_old, z_log_std_new))
+            #
+            #     adj_h = sample_reconstruction(z_mean, z_log_std)
+            #     if refit:
+            #         adj_hat = (adj_h > 0).type(torch.FloatTensor)
+            #         adj_hat[:feat.size(0), :feat.size(0)] = torch.from_numpy(adj_train)
+            #         z_mean, z_log = hgcn_step(adj_hat, X_all)
+            #         adj_h = sample_reconstruction(z_mean, z_log_std)
+            #
+            #     test_loss = reconstruction_loss_A(adj_gt_all, adj_h, mask, test=True)
+            #     auc_rgcn = get_roc_auc_score(adj_gt_all, adj_h, mask)
+            #     ap_rgcn = get_average_precision_score(adj_gt_all, adj_h, mask)
+            #
+            #     info = 'R-GCN test loss: {:.6f}'.format(test_loss)
+            #     print(info)
+            #     logging.info(info)
+            #
+            #     # test original gcn
+            #     hgcn_vae.eval()
+            #     adj_vae_norm = torch.eye(X_all.size()[0])
+            #     adj_vae_norm[:feat.size()[0], :feat.size()[0]] = adj_feed_norm
+            #     z_mean, z_log_std = hgcn_vae(adj_vae_norm, X_all)
+            #     adj_h = sample_reconstruction(z_mean, z_log_std)
+            #     test_loss = reconstruction_loss_A(adj_gt_all, adj_h, mask, test=True)
+            #     auc_gcn = get_roc_auc_score(adj_gt_all, adj_h, mask)
+            #     ap_gcn = get_average_precision_score(adj_gt_all, adj_h, mask)
+            #
+            #     info = 'Original GCN test loss: {:.6f}'.format(test_loss)
+            #     print(info)
+            #     logging.info(info)
+            #
+            #     # test on mlp
+            #     decoder.eval()
+            #     z_mean, z_log_std = decoder(X_all)
+            #     adj_h = sample_reconstruction(z_mean, z_log_std)
+            #     test_loss = reconstruction_loss_A(adj_gt_all, adj_h, mask, test=True)
+            #     auc_mlp = get_roc_auc_score(adj_gt_all, adj_h, mask)
+            #     ap_mlp = get_average_precision_score(adj_gt_all, adj_h, mask)
+            #     info = 'MLP test loss: {:.6f}'.format(test_loss)
+            #     print(info)
+            #     logging.info(info)
+            #
+            #     # test on
+            #
+            #     print('AUC:')
+            #     info = 'R-LHGCN auc: {:.6f}'.format(auc_rgcn)
+            #     print(info)
+            #     logging.info(info)
+            #     info = 'Original GCN auc: {:.6f}'.format(auc_gcn)
+            #     print(info)
+            #     logging.info(info)
+            #     info = 'MLP auc: {:.6f}'.format(auc_mlp)
+            #     print(info)
+            #     logging.info(info)
+            #
+            #     info = 'R-GCN AP: {:.6f}'.format(ap_rgcn)
+            #     print(info)
+            #     logging.info(info)
+            #     info = 'Original GCN AP: {:.6f}'.format(ap_gcn)
+            #     print(info)
+            #     logging.info(info)
+            #     info = 'MLP AP: {:.6f}'.format(ap_mlp)
+            #     print(info)
+            #     logging.info(info)
+
+
+def predictor_engine(size_update):
+    """
+    #     to run the training process
+    #     :param hgcn_step: the hgcn add_on module
+    #     :param hgcn_vae: encoder variational procedure
+    #     :param decoder: can be sort of MLP
+    #     :param predictor: can be sort of MLP
+    #     :return: none
+    #     """
+    # optimizers for log P(A_i+1,X_i+1|A_i, X_i)
+    optimizer_embedder = torch.optim.Adam(hgcn_step.parameters(), lr=1e-3)
+    optimizer_vae = torch.optim.Adam(hgcn_vae.parameters(), lr=1e-3)
+    optimizer_decoder = torch.optim.Adam(decoder.parameters(), lr=1e-3)
+    #optimizer for log P(height|X_i+1)
+    optimizer_predictor = torch.optim.Adam(Regressor.parameters(), lr=1e-3)
+    train_loss = 0
+
+    for batch_idx, (adj, feat, labels) in enumerate(dataloader):
+        adj = adj[0]
+
+        if adj.size()[0] <= size_update:
+            print("Warning: sample size {} too small".format(adj.size()[0]))
+            continue
+
+        # train R-LHGCN: for recovery of series of adjs
+        print('training on embedder begins')
+        optimizer_embedder.zero_grad()
+        hgcn_step.train()
+        loss = recursive_loss_with_noise()
+        loss.backward()
+        train_loss += loss.item()
+        optimizer_embedder.step()
+
+        # train LGCN via VAE
+        print('training on VAE begins')
+        optimizer_vae.zero_grad()
+        hgcn_vae.train()
+        adj_vae_norm = anormalize(adj)
+        z_mean, z_log_std = hgcn_vae(adj_vae_norm, feat)
+        vae_predict_train_loss = vae_loss_predict(z_mean, z_log_std, adj, feat, labels,  Regressor)
+        vae_predict_train_loss.backward()
+        optimizer_vae.step()
+
+        #train decoder for adjs
+        print('training on decoder begins')
+        optimizer_decoder.zero_grad()
+        decoder.train()
+        z_mean, z_log_std = decoder(feat)
+        decoder_train_loss = vae_loss_predict(z_mean, z_log_std, adj, feat, labels,  Regressor)
+        decoder_train_loss.backward()
+        optimizer_decoder.step()
+
+        #train the gcn regressor
+        print('training on regressor begins')
+        optimizer_predictor.zero_grad()
+        Regressor.train()
+        predictor_train_loss = vae_loss_predict(z_mean, z_log_std, adj, feat, labels,  Regressor)
+        predictor_train_loss.backward()
+        optimizer_predictor.step()
+
+        if batch_idx % 10 == 0:
+            info ='R-LHGCN [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(batch_idx, len(dataloader),
+                    100. * batch_idx / len(dataloader),
+                    loss.item())
+            print(info)
+            logging.info(info)
+            torch.save(hgcn_step.state_dict(), './models/hgcn_step/%d.pth'%batch_idx)
+
+            info = 'LGCN [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(batch_idx, len(dataloader),
+                    100. * batch_idx / len(dataloader),
+                    vae_predict_train_loss.item())
+            print(info)
+            logging.info(info)
+            torch.save(hgcn_vae.state_dict(), './models/hgcn_vae/%d.pth' % batch_idx)
+
+            info = 'Decoder [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(batch_idx, len(dataloader),
+                    100. * batch_idx / len(dataloader),
+                    decoder_train_loss.item())
+            print(info)
+            logging.info(info)
+            torch.save(decoder.state_dict(), './models/decoder/%d.pth' % batch_idx)
+
+            info = 'Regressor [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(batch_idx, len(dataloader),
+                                                                    100. * batch_idx / len(dataloader),
+                                                                    predictor_train_loss.item())
+            print(info)
+            logging.info(info)
+            torch.save(Regressor.state_dict(), './models/regressor/%d.pth' % batch_idx)
+
+            # with torch.no_grad():# model.eval() is not proper
+            #     adj_feed_norm = anormalize(adj_train)
+            #     adj_gt_all = adj_all
+            #
+            #     #feat = X_train
+            #     #feat_all = X_all
+            #
+            #     mask = torch.ones_like(adj_gt_all).type(torch.ByteTensor)
+            #     mask[:feat.size()[0], :feat.size()[0]] = 0
+            #
+            #     diag_mask = torch.eye(mask.size(0)).type(torch.ByteTensor)
+            #     mask = mask * (1 - diag_mask)
+            #
+            #     mask = get_equal_mask(adj_gt_all, mask)
+            #
+            #     # test r-lhgcn
+            #     hgcn_step.eval()
+            #     z_mean_old, z_log_std_old, z_mean_new, z_log_std_new = hgcn_step(torch.from_numpy(adj_train), feat,
+            #                                                                     X_all[feat.size()[0]:, :])
+            #     z_mean = torch.cat((z_mean_old, z_mean_new))
+            #     z_log_std = torch.cat((z_log_std_old, z_log_std_new))
+            #
+            #     adj_h = sample_reconstruction(z_mean, z_log_std)
+            #     if refit:
+            #         adj_hat = (adj_h > 0).type(torch.FloatTensor)
+            #         adj_hat[:feat.size(0), :feat.size(0)] = torch.from_numpy(adj_train)
+            #         z_mean, z_log = hgcn_step(adj_hat, X_all)
+            #         adj_h = sample_reconstruction(z_mean, z_log_std)
+            #
+            #     test_loss = reconstruction_loss_A(adj_gt_all, adj_h, mask, test=True)
+            #     auc_rgcn = get_roc_auc_score(adj_gt_all, adj_h, mask)
+            #     ap_rgcn = get_average_precision_score(adj_gt_all, adj_h, mask)
+            #
+            #     info = 'R-GCN test loss: {:.6f}'.format(test_loss)
+            #     print(info)
+            #     logging.info(info)
+            #
+            #     # test original gcn
+            #     hgcn_vae.eval()
+            #     adj_vae_norm = torch.eye(X_all.size()[0])
+            #     adj_vae_norm[:feat.size()[0], :feat.size()[0]] = adj_feed_norm
+            #     z_mean, z_log_std = hgcn_vae(adj_vae_norm, X_all)
+            #     adj_h = sample_reconstruction(z_mean, z_log_std)
+            #     test_loss = reconstruction_loss_A(adj_gt_all, adj_h, mask, test=True)
+            #     auc_gcn = get_roc_auc_score(adj_gt_all, adj_h, mask)
+            #     ap_gcn = get_average_precision_score(adj_gt_all, adj_h, mask)
+            #
+            #     info = 'Original GCN test loss: {:.6f}'.format(test_loss)
+            #     print(info)
+            #     logging.info(info)
+            #
+            #     # test on mlp
+            #     decoder.eval()
+            #     z_mean, z_log_std = decoder(X_all)
+            #     adj_h = sample_reconstruction(z_mean, z_log_std)
+            #     test_loss = reconstruction_loss_A(adj_gt_all, adj_h, mask, test=True)
+            #     auc_mlp = get_roc_auc_score(adj_gt_all, adj_h, mask)
+            #     ap_mlp = get_average_precision_score(adj_gt_all, adj_h, mask)
+            #     info = 'MLP test loss: {:.6f}'.format(test_loss)
+            #     print(info)
+            #     logging.info(info)
+            #
+            #     # test on
+            #
+            #     print('AUC:')
+            #     info = 'R-LHGCN auc: {:.6f}'.format(auc_rgcn)
+            #     print(info)
+            #     logging.info(info)
+            #     info = 'Original GCN auc: {:.6f}'.format(auc_gcn)
+            #     print(info)
+            #     logging.info(info)
+            #     info = 'MLP auc: {:.6f}'.format(auc_mlp)
+            #     print(info)
+            #     logging.info(info)
+            #
+            #     info = 'R-GCN AP: {:.6f}'.format(ap_rgcn)
+            #     print(info)
+            #     logging.info(info)
+            #     info = 'Original GCN AP: {:.6f}'.format(ap_gcn)
+            #     print(info)
+            #     logging.info(info)
+            #     info = 'MLP AP: {:.6f}'.format(ap_mlp)
+            #     print(info)
+            #     logging.info(info)
+
+if __name__ == "__main__":
+    classifier_engine(size_update)
+    # model_dict=model.load_state_dict(torch.load(PATH))
+
+
+
+
+
